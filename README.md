@@ -4,6 +4,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IRON ARENA — Turn-Based Combat</title>
 <link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700;900&family=Cinzel:wght@400;600&family=IM+Fell+English:ital@0;1&display=swap" rel="stylesheet">
+<!-- ethers.js for wallet signing (EIP-1193 compatible: MetaMask, Coinbase, Rabby, Trust, etc.) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.7.0/ethers.umd.min.js"></script>
 <!-- Firebase SDK -->
 <script type="module">
   import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
@@ -1910,19 +1912,22 @@
 
       <!-- Wallet Address -->
       <div class="shop-item">
-        <div class="shop-item-name">👛 Wallet Address <span style="color:var(--red2);font-size:0.75rem;margin-left:0.3rem;">★ REQUIRED</span></div>
-        <div class="shop-item-desc">Required to play. Enter your Ethereum wallet address (0x...) to receive XP rewards and guild distributions. Must be a valid ETH address — no duplicates allowed.</div>
+        <div class="shop-item-name">👛 Wallet <span style="color:var(--red2);font-size:0.75rem;margin-left:0.3rem;">★ REQUIRED</span></div>
+        <div class="shop-item-desc">Connect your Ethereum wallet to save progress on-chain and receive $PvE rewards. Works with MetaMask, Coinbase Wallet, Rabby, Trust Wallet, and any EIP-1193 compatible wallet.</div>
         <div class="wallet-required-banner hidden" id="wallet-required-banner">
-          ⚠ You must save a wallet address before entering the arena.
+          ⚠ You must connect a wallet before entering the arena.
         </div>
         <div class="wallet-linked-banner hidden" id="wallet-linked-banner"></div>
-        <div class="name-input-row">
-          <input class="name-input" id="wallet-input" type="text" maxlength="64"
-            placeholder="0x1234...abcd (42 characters)"
-            style="font-family:monospace; font-size:0.82rem; letter-spacing:0.03em;" />
-          <button class="btn-buy btn-buy-gold" onclick="saveWalletAddress()">SAVE</button>
+        <!-- Connect state -->
+        <div id="wallet-connect-area">
+          <button class="btn-buy btn-buy-gold" id="btn-connect-wallet" onclick="connectWallet()" style="width:100%;padding:0.6rem;font-size:0.95rem;letter-spacing:0.1em;">
+            🔗 CONNECT WALLET
+          </button>
+          <div id="wallet-error" style="font-size:0.82rem; color:var(--red2); margin-top:0.5rem; min-height:1rem;"></div>
+          <div style="font-size:0.75rem;color:var(--text3);margin-top:0.4rem;font-style:italic;text-align:center;">
+            Opens your wallet app to sign a message — no transaction, no gas fee.
+          </div>
         </div>
-        <div id="wallet-error" style="font-size:0.82rem; color:var(--red2); margin-top:0.3rem;"></div>
       </div>
 
     </div>
@@ -2741,72 +2746,349 @@ function setHeroName() {
   saveGame();
 }
 
-async function saveWalletAddress() {
-  const input  = document.getElementById('wallet-input');
+// ============================================================
+// WALLET CONNECTION  (EIP-1193 — MetaMask, Coinbase, Rabby, Trust, etc.)
+// ============================================================
+
+async function connectWallet() {
   const errEl  = document.getElementById('wallet-error');
-  const addr   = input.value.trim();
+  const btn    = document.getElementById('btn-connect-wallet');
+  if (errEl) errEl.textContent = '';
 
-  if (!addr) { if(errEl) errEl.textContent = 'Please enter a wallet address.'; return; }
-
-  // Ethereum address validation: must be 0x + 40 hex chars (42 total)
-  const ethRegex = /^0x[0-9a-fA-F]{40}$/;
-  if (!ethRegex.test(addr)) {
-    if(errEl) errEl.textContent = 'Invalid Ethereum address. Must start with 0x followed by 40 hex characters (42 chars total).';
+  // Must have window.ethereum (any EIP-1193 provider)
+  if (!window.ethereum) {
+    if (errEl) errEl.textContent = 'No Ethereum wallet detected. Install MetaMask, Rabby, or Coinbase Wallet and refresh.';
     return;
   }
 
-  // Check for duplicate in Firebase
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Connecting...'; }
+
+  try {
+    // Request account access
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    if (!accounts || accounts.length === 0) throw new Error('No accounts returned.');
+    const address = accounts[0].toLowerCase();
+
+    if (btn) btn.textContent = '✍ Sign to verify...';
+
+    // Sign a deterministic message to prove ownership — no gas, no transaction
+    const message = `Iron Arena identity proof\nAddress: ${address}\nTimestamp: ${Math.floor(Date.now() / 300000)}`; // 5-min window
+    const signature = await window.ethereum.request({
+      method: 'personal_sign',
+      params: [message, address],
+    });
+
+    // Verify signature client-side with ethers
+    if (typeof ethers !== 'undefined') {
+      const recovered = ethers.verifyMessage(message, signature).toLowerCase();
+      if (recovered !== address) throw new Error('Signature mismatch — could not verify wallet ownership.');
+    }
+
+    // Wallet verified — use address as identity
+    await onWalletVerified(address);
+
+  } catch (err) {
+    console.warn('Wallet connect failed:', err);
+    const msg = err?.message || String(err);
+    if (msg.includes('User rejected') || msg.includes('user rejected') || msg.includes('4001')) {
+      if (errEl) errEl.textContent = 'Connection cancelled.';
+    } else {
+      if (errEl) errEl.textContent = 'Connection failed: ' + msg.slice(0, 120);
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🔗 CONNECT WALLET'; }
+  }
+}
+
+async function onWalletVerified(address) {
+  const errEl = document.getElementById('wallet-error');
+  if (errEl) errEl.textContent = '';
+
+  const prevAddress = shopState.walletAddress ? shopState.walletAddress.toLowerCase() : '';
+
+  // If same wallet already connected — nothing to do
+  if (prevAddress === address) {
+    showSaveToast('✔ Wallet already connected!', '#27ae60');
+    renderWalletDisplay();
+    return;
+  }
+
+  // Get the old random uid that was used before wallet connection
+  const oldUid = localStorage.getItem('ironArena_uid');
+  const oldUidIsRandom = oldUid && oldUid.startsWith('p_');
+
+  // Gather data from all possible sources in parallel
+  let firebaseWalletSave  = null;   // existing save already keyed to this wallet
+  let firebaseOldLbEntry  = null;   // old leaderboard entry under random uid
+  let firebaseOldSave     = null;   // old full save under random uid (if exists)
+
   if (window._fbReady) {
-    if(errEl) errEl.textContent = 'Checking address...';
+    showSaveToast('⏳ Checking for existing saves...', '#7a5c1e');
     try {
-      const snap = await window._fbGet(window._fbRef(window._fbDb, 'scores'));
-      if (snap.exists()) {
-        const myUid = getLbPlayerKey().replace('lb:', '');
-        const duplicate = Object.entries(snap.val()).find(([uid, d]) =>
-          uid !== myUid && d.wallet && d.wallet.toLowerCase() === addr.toLowerCase()
-        );
-        if (duplicate) {
-          if(errEl) errEl.textContent = 'This wallet address is already registered to another account.';
-          return;
-        }
-      }
-    } catch(e) {
-      console.warn('Duplicate check failed:', e);
-      // Allow save if check fails — don't block the user
+      const [walletSnap, oldLbSnap, oldSaveSnap] = await Promise.all([
+        window._fbGet(window._fbRef(window._fbDb, 'saves/'  + address)),
+        oldUidIsRandom
+          ? window._fbGet(window._fbRef(window._fbDb, 'scores/' + oldUid))
+          : Promise.resolve(null),
+        oldUidIsRandom
+          ? window._fbGet(window._fbRef(window._fbDb, 'saves/'  + oldUid))
+          : Promise.resolve(null),
+      ]);
+      if (walletSnap?.exists())  firebaseWalletSave = walletSnap.val();
+      if (oldLbSnap?.exists())   firebaseOldLbEntry = oldLbSnap.val();
+      if (oldSaveSnap?.exists()) firebaseOldSave    = oldSaveSnap.val();
+    } catch (e) {
+      console.warn('Migration data fetch failed:', e);
     }
   }
 
-  shopState.walletAddress = addr;
-  if(errEl) errEl.textContent = '';
-  input.value = '';
-  addLog(`👛 <span class="log-win">Wallet saved: ${addr.slice(0,8)}...${addr.slice(-4)}</span>`, 'system');
+  // ── Determine best save to use ──────────────────────────────
+  // Score saves by wave reached as the canonical "best progress" metric
+  const scoreOf = d => d ? (d.wave || 0) * 100000 + (d.lifetimeXP || d.totalXP || 0) : -1;
+
+  const localScore      = scoreOf({ wave: state.wave, lifetimeXP: state.lifetimeXP, totalXP: state.totalXP });
+  const walletSaveScore = scoreOf(firebaseWalletSave);
+  const oldSaveScore    = scoreOf(firebaseOldSave);
+
+  // Build a ranked list of candidate saves (excluding empties)
+  const candidates = [
+    firebaseWalletSave && { label: `Firebase (wallet-linked) — Wave ${firebaseWalletSave.wave || 1}, ${(firebaseWalletSave.lifetimeXP || firebaseWalletSave.totalXP || 0).toLocaleString()} XP`, data: firebaseWalletSave, score: walletSaveScore },
+    firebaseOldSave    && { label: `Firebase (pre-wallet)    — Wave ${firebaseOldSave.wave    || 1}, ${(firebaseOldSave.lifetimeXP    || firebaseOldSave.totalXP    || 0).toLocaleString()} XP`, data: firebaseOldSave,    score: oldSaveScore    },
+    { label: `Local device              — Wave ${state.wave}, ${state.lifetimeXP.toLocaleString()} XP`, data: null /* already loaded */, score: localScore },
+  ].filter(Boolean).sort((a, b) => b.score - a.score);
+
+  // Pick the highest-scoring save automatically, but confirm with user
+  const best = candidates[0];
+  const hasConflict = candidates.length > 1 && candidates[0].score !== candidates[candidates.length - 1].score;
+
+  let chosenData = null; // null = keep current in-memory state
+
+  if (hasConflict) {
+    // Multiple saves exist with different progress — ask the player
+    const lines = candidates.map((c, i) => `${i === 0 ? '★ ' : '  '}[${i + 1}] ${c.label}`).join('\n');
+    const choice = prompt(
+      `Multiple saves found for this wallet.\n\n` +
+      `${lines}\n\n` +
+      `Enter 1–${candidates.length} to choose, or Cancel to abort.`
+    );
+    const idx = parseInt(choice) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= candidates.length) {
+      showSaveToast('Wallet connection cancelled.', '#e74c3c');
+      return;
+    }
+    chosenData = candidates[idx].data; // null means keep local
+  } else if (best.data && best.score > localScore) {
+    // Only one better save exists — confirm silently
+    const ok = confirm(
+      `Found a better save for this wallet!\n\n` +
+      `${best.label}\n\n` +
+      `Load it? (Current local progress will be replaced.)`
+    );
+    if (!ok) {
+      // User wants to keep local — we'll migrate local up to Firebase instead
+      chosenData = null;
+    } else {
+      chosenData = best.data;
+    }
+  }
+  // else: local is best or equal — keep it, migrate it up to Firebase
+
+  // ── Apply chosen save ───────────────────────────────────────
+  if (chosenData) {
+    applyLoadedSave(chosenData);
+  }
+
+  // ── Commit identity switch ──────────────────────────────────
+  shopState.walletAddress = address;
+  lbMyKey = 'lb:' + address;
+  localStorage.setItem('ironArena_uid', address);
+
+  // ── Firebase migration ──────────────────────────────────────
+  if (window._fbReady && oldUidIsRandom) {
+    try {
+      // 1. Migrate old leaderboard entry to wallet-keyed slot (take best stats)
+      if (firebaseOldLbEntry) {
+        const existingLbSnap = await window._fbGet(window._fbRef(window._fbDb, 'scores/' + address)).catch(() => null);
+        const existingLb = existingLbSnap?.exists() ? existingLbSnap.val() : null;
+
+        const merged = mergeLeaderboardEntries(firebaseOldLbEntry, existingLb, address);
+        await window._fbSet(window._fbRef(window._fbDb, 'scores/' + address), merged);
+
+        // 2. Delete the old orphaned leaderboard entry
+        await window._fbSet(window._fbRef(window._fbDb, 'scores/' + oldUid), null);
+        addLog(`🔄 <span class="log-win">Old leaderboard history migrated to wallet.</span>`, 'system');
+      }
+
+      // 3. Delete old anonymous save if it existed
+      if (firebaseOldSave) {
+        await window._fbSet(window._fbRef(window._fbDb, 'saves/' + oldUid), null);
+      }
+
+      // 4. Swap old uid for wallet address in guild members list
+      if (guildState.myGuildCode) {
+        try {
+          const guildSnap = await window._fbGet(window._fbRef(window._fbDb, 'guilds/' + guildState.myGuildCode));
+          if (guildSnap.exists()) {
+            const guild = guildSnap.val();
+            let changed = false;
+
+            // Swap uid in members array
+            if (Array.isArray(guild.members)) {
+              const idx = guild.members.indexOf(oldUid);
+              if (idx !== -1) {
+                guild.members[idx] = address;
+                changed = true;
+              }
+              // Deduplicate in case wallet address was already in there
+              guild.members = [...new Set(guild.members)];
+            }
+
+            // Swap uid if this player is the guild leader
+            if (guild.leaderKey === oldUid) {
+              guild.leaderKey = address;
+              changed = true;
+            }
+
+            if (changed) {
+              await window._fbSet(window._fbRef(window._fbDb, 'guilds/' + guildState.myGuildCode), guild);
+              addLog(`⚔ <span class="log-win">Guild membership transferred to wallet.</span>`, 'system');
+            }
+          }
+        } catch (e) {
+          console.warn('Guild uid swap failed (non-critical):', e);
+        }
+      }
+
+      // 5. Swap uid in any pending guild XP distributions
+      if (guildState.myGuildCode) {
+        try {
+          const xpSnap = await window._fbGet(window._fbRef(window._fbDb, 'guildXP/' + guildState.myGuildCode + '/' + oldUid));
+          if (xpSnap.exists() && xpSnap.val() > 0) {
+            const pending = xpSnap.val();
+            await window._fbSet(window._fbRef(window._fbDb, 'guildXP/' + guildState.myGuildCode + '/' + address), pending);
+            await window._fbSet(window._fbRef(window._fbDb, 'guildXP/' + guildState.myGuildCode + '/' + oldUid), null);
+            addLog(`💰 <span class="log-win">Pending guild XP (${pending.toLocaleString()}) transferred to wallet.</span>`, 'system');
+          }
+        } catch (e) {
+          console.warn('Guild XP uid swap failed (non-critical):', e);
+        }
+      }
+
+    } catch (e) {
+      console.warn('Migration cleanup failed (non-critical):', e);
+    }
+  }
+
+  addLog(`👛 <span class="log-win">Wallet connected & history migrated: ${address.slice(0,8)}...${address.slice(-4)}</span>`, 'system');
   renderWalletDisplay();
   updateFightButtonWalletGate();
-  saveGame();
+  renderSkills();
+  updateXPDisplay();
+  renderSkinGrid();
+  saveGame(); // writes full save + leaderboard under wallet address
+}
+
+// Merge two leaderboard entries — take the best stats from each
+function mergeLeaderboardEntries(oldEntry, newEntry, walletAddress) {
+  if (!newEntry) return { ...oldEntry, wallet: walletAddress };
+  return {
+    name:            newEntry.name            || oldEntry.name            || 'Anonymous Warrior',
+    skin:            newEntry.skin            || oldEntry.skin            || '🧙',
+    wave:            Math.max(newEntry.wave            || 0, oldEntry.wave            || 0),
+    totalXP:         Math.max(newEntry.totalXP         || 0, oldEntry.totalXP         || 0),
+    lifetimeXP:      Math.max(newEntry.lifetimeXP      || 0, oldEntry.lifetimeXP      || 0),
+    enemiesDefeated: Math.max(newEntry.enemiesDefeated || 0, oldEntry.enemiesDefeated || 0),
+    totalSkillLv:    Math.max(newEntry.totalSkillLv    || 0, oldEntry.totalSkillLv    || 0),
+    guildCode:       newEntry.guildCode || oldEntry.guildCode || null,
+    wallet:          walletAddress,
+    ts:              Date.now(),
+  };
+}
+
+async function loadSaveFromFirebase(address) {
+  if (!window._fbReady) return null;
+  try {
+    const snap = await window._fbGet(window._fbRef(window._fbDb, 'saves/' + address));
+    return snap.exists() ? snap.val() : null;
+  } catch (e) {
+    console.warn('Firebase save load failed:', e);
+    return null;
+  }
+}
+
+function applyLoadedSave(data) {
+  Object.assign(state.skills,      data.skills      || {});
+  Object.assign(state.skillClicks, data.skillClicks || {});
+  state.totalXP         = data.totalXP         || 0;
+  state.lifetimeXP      = data.lifetimeXP      || state.totalXP;
+  state.enemiesDefeated = data.enemiesDefeated  || 0;
+  state.wave            = data.wave             || 1;
+  if (data.shop) {
+    shopState.heroName          = data.shop.heroName          || '';
+    shopState.nameChangeCount   = data.shop.nameChangeCount   || 0;
+    shopState.equippedSkin      = data.shop.equippedSkin      || 0;
+    shopState.ownedSkins        = data.shop.ownedSkins        || [0];
+    shopState.oneStrikeUnlocked = data.shop.oneStrikeUnlocked || false;
+    // walletAddress set separately
+  }
+  if (data.guild?.code) {
+    guildState.myGuildCode = data.guild.code;
+    guildState.myGuildName = data.guild.name;
+    guildState.isLeader    = data.guild.isLeader || false;
+    saveGuildLocally();
+  }
+  if (data.potions) {
+    potionState.poison.owned = data.potions.poisonOwned || false;
+    potionState.miss.owned   = data.potions.missOwned   || false;
+  }
+  if (shopState.heroName) {
+    const nameEl = document.querySelector('.combatant-name');
+    if (nameEl) nameEl.textContent = shopState.heroName.toUpperCase();
+    const costEl = document.getElementById('name-cost-label');
+    if (costEl) costEl.textContent = 'Rename costs 10 XP';
+  }
+  if (shopState.equippedSkin > 0) {
+    document.getElementById('player-sprite').textContent = SKINS[shopState.equippedSkin].emoji;
+  }
+  document.getElementById('wave-num').textContent = state.wave;
+  document.getElementById('enemy-count').textContent = state.enemiesDefeated;
+  document.getElementById('btn-fight').textContent = state.wave > 1
+    ? `⚔ CHALLENGE WAVE ${state.wave}` : '⚔ ENTER THE ARENA';
 }
 
 function renderWalletDisplay() {
   const req    = document.getElementById('wallet-required-banner');
   const linked = document.getElementById('wallet-linked-banner');
+  const area   = document.getElementById('wallet-connect-area');
   if (!req || !linked) return;
   if (shopState.walletAddress) {
     req.classList.add('hidden');
     linked.classList.remove('hidden');
-    linked.innerHTML = '✔ Wallet linked: <span style="font-family:monospace;font-size:0.8rem;opacity:0.85;">'
-      + shopState.walletAddress + '</span>'
-      + ' <button onclick="clearWallet()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:0.75rem;margin-left:0.5rem;text-decoration:underline;">change</button>';
+    if (area) area.style.display = 'none';
+    const short = shopState.walletAddress.slice(0,8) + '...' + shopState.walletAddress.slice(-4);
+    linked.innerHTML =
+      '✔ Wallet connected: <span style="font-family:monospace;font-size:0.8rem;opacity:0.85;">' + short + '</span>' +
+      ' <button onclick="disconnectWallet()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:0.75rem;margin-left:0.5rem;text-decoration:underline;">disconnect</button>';
   } else {
     req.classList.remove('hidden');
     linked.classList.add('hidden');
+    if (area) area.style.display = '';
   }
 }
 
-function clearWallet() {
+function disconnectWallet() {
+  if (!confirm('Disconnect wallet?\n\nYour local progress is saved. You can reconnect the same wallet anytime to restore it.')) return;
   shopState.walletAddress = '';
+  lbMyKey = null; // will regenerate a random uid next save
+  localStorage.removeItem('ironArena_uid');
   renderWalletDisplay();
   updateFightButtonWalletGate();
   saveGame();
 }
+
+// Legacy stub — no longer used but kept so old HTML references don't break
+function saveWalletAddress() { connectWallet(); }
+function clearWallet() { disconnectWallet(); }
 
 // Block the fight button until wallet is saved
 function updateFightButtonWalletGate() {
@@ -2814,7 +3096,7 @@ function updateFightButtonWalletGate() {
   if (!fightBtn) return;
   if (!shopState.walletAddress) {
     fightBtn.disabled = true;
-    fightBtn.title = 'Save your wallet address in the XP Shop → Name tab first';
+    fightBtn.title = 'Connect your wallet in the XP Shop → Name tab first';
     fightBtn.style.opacity = '0.4';
     fightBtn.style.cursor  = 'not-allowed';
   } else {
@@ -3436,10 +3718,16 @@ const LB_MAX     = 100;            // max entries to store globally
 let   lbCurrentTab = 'lifetime';
 let   lbMyKey = null;              // this player's storage key
 
-// Derive a stable player key from hero name + browser fingerprint
+// Derive a stable player key — wallet address takes priority, fallback to random uid
 function getLbPlayerKey() {
   if (lbMyKey) return lbMyKey;
-  // Use hero name + a stored local UID
+  // If wallet is connected, use it as the key (verified ownership)
+  if (shopState.walletAddress) {
+    lbMyKey = LB_PREFIX + shopState.walletAddress.toLowerCase();
+    localStorage.setItem('ironArena_uid', shopState.walletAddress.toLowerCase());
+    return lbMyKey;
+  }
+  // Fallback: stored uid (random, pre-wallet)
   let uid = localStorage.getItem('ironArena_uid');
   if (!uid) {
     uid = 'p_' + Math.random().toString(36).slice(2, 10);
@@ -3621,6 +3909,11 @@ function saveGame() {
     localStorage.setItem(SAVE_KEY, JSON.stringify(data));
     showSaveToast('✔ Progress saved!', '#27ae60');
     submitLeaderboardScore(); // push to shared leaderboard
+    // If wallet connected, also write full save to Firebase for cross-device restore
+    if (shopState.walletAddress && window._fbReady) {
+      const addr = shopState.walletAddress.toLowerCase();
+      window._fbSet(window._fbRef(window._fbDb, 'saves/' + addr), data).catch(e => console.warn('Firebase save write failed:', e));
+    }
   } catch(e) {
     showSaveToast('⚠ Save failed', '#e74c3c');
   }
@@ -3887,6 +4180,31 @@ async function downloadSnapshotCSV() {
   claimGuildXP();
   renderWalletDisplay();
   updateFightButtonWalletGate(); // claim any pending guild XP distribution
+
+  // Listen for wallet account changes (user switches wallet inside extension)
+  if (window.ethereum) {
+    window.ethereum.on('accountsChanged', (accounts) => {
+      if (!accounts || accounts.length === 0) {
+        // Wallet locked / disconnected externally
+        if (shopState.walletAddress) {
+          showSaveToast('⚠ Wallet disconnected', '#e74c3c');
+          shopState.walletAddress = '';
+          lbMyKey = null;
+          renderWalletDisplay();
+          updateFightButtonWalletGate();
+        }
+      } else {
+        const newAddr = accounts[0].toLowerCase();
+        if (newAddr !== shopState.walletAddress?.toLowerCase()) {
+          showSaveToast('🔄 Wallet account changed — reconnect to verify', '#f59e0b');
+          shopState.walletAddress = '';
+          lbMyKey = null;
+          renderWalletDisplay();
+          updateFightButtonWalletGate();
+        }
+      }
+    });
+  }
   // Update Firebase banner status after SDK loads
   setTimeout(() => {
     const banner = document.getElementById('firebase-banner');
